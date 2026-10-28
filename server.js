@@ -4,6 +4,7 @@ const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json({ limit: "20kb" }));
+app.use(express.urlencoded({ extended: false, limit: "20kb" }));
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET;
