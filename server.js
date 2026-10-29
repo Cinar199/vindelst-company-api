@@ -1,675 +1,722 @@
-
 const express = require("express");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-app.use(express.json({ limit: "20kb" }));
-app.use(express.urlencoded({ extended: false, limit: "20kb" }));
+app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY;
+const API_SECRET = process.env.API_SECRET;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 
 const GUILD_ID = "1553429884582502400";
 
-const APPROVAL_ROLES = new Set([
+const APPROVAL_ROLES = [
   "1553836431913386047",
   "1553826346713489458",
-  "1553774180112138240"
-]);
+  "1553774180112138240",
+];
 
-if (!API_SECRET || !SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("Gerekli ortam değişkenleri eksik.");
-  process.exit(1);
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !API_SECRET) {
+  throw new Error("Supabase veya API ortam değişkenleri eksik.");
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: {
-    autoRefreshToken: false,
-    persistSession: false
-  }
-});
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
 
-app.get("/health", (req, res) => {
-  res.json({
-    online: true,
-    project: "Vindelst Company API"
-  });
-});
-
+// API güvenliği
 app.use((req, res, next) => {
-  if (req.get("authorization") !== `Bearer ${API_SECRET}`) {
-    return res.status(401).json({ error: "Yetkisiz erişim." });
+  if (req.path === "/health") return next();
+
+  const authorization = req.headers.authorization;
+
+  if (authorization !== `Bearer ${API_SECRET}`) {
+    return res.status(401).json({
+      success: false,
+      error: "Yetkisiz erişim.",
+    });
   }
+
   next();
 });
 
-function validDiscordId(value) {
-  return typeof value === "string" && /^\d{17,20}$/.test(value);
-}
-
-function validCompanyId(value) {
-  return /^\d+$/.test(String(value)) &&
-    Number(value) > 0 &&
-    Number.isSafeInteger(Number(value));
-}
-
-function validAmount(value) {
-  const amount = Number(value);
-  return Number.isFinite(amount) &&
-    amount > 0 &&
-    amount <= 1000000000000;
-}
-
-function sendDbError(res, error) {
-  const message = String(error?.message || "");
-
-  if (message.includes("COMPANY_NOT_FOUND")) {
-    return res.status(404).json({ error: "Şirket bulunamadı veya aktif değil." });
-  }
-  if (message.includes("INSUFFICIENT_BALANCE")) {
-    return res.status(400).json({ error: "Şirket kasasında yeterli para yok." });
-  }
-  if (message.includes("MAX_LEVEL")) {
-    return res.status(400).json({ error: "Şirket zaten maksimum 6. seviyede." });
-  }
-  if (message.includes("INVALID_CASH_REQUEST")) {
-    return res.status(400).json({ error: "Geçersiz kasa işlemi." });
-  }
-  if (message.includes("APPLICATION_NOT_FOUND")) {
-    return res.status(404).json({ error: "Başvuru bulunamadı." });
-  }
-  if (message.includes("APPLICATION_ALREADY_DECIDED")) {
-    return res.status(409).json({ error: "Bu başvuru daha önce sonuçlandırılmış." });
-  }
-
-  console.error("Supabase hatası:", message);
-  return res.status(500).json({ error: "İşlem sırasında sunucu hatası oluştu." });
-}
-
+// Discord sunucu üyesini getir
 async function getDiscordMember(userId) {
   if (!DISCORD_BOT_TOKEN) {
-    throw new Error("DISCORD_BOT_TOKEN_MISSING");
+    throw new Error("DISCORD_BOT_TOKEN ayarlanmamış.");
   }
 
   const response = await fetch(
     `https://discord.com/api/v10/guilds/${GUILD_ID}/members/${userId}`,
     {
       headers: {
-        Authorization: `Bot ${DISCORD_BOT_TOKEN}`
-      }
+        Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+      },
     }
   );
 
-  if (response.status === 404) return null;
-
   if (!response.ok) {
-    const error = new Error("DISCORD_MEMBER_LOOKUP_FAILED");
-    error.status = response.status;
-    throw error;
+    if (response.status === 404) return null;
+
+    throw new Error(
+      `Discord API hatası: ${response.status}`
+    );
   }
 
   return response.json();
 }
 
-async function getDiscordRoles(userId) {
+// Yetkili rol kontrolü
+async function hasApprovalRole(userId) {
   const member = await getDiscordMember(userId);
-  return member ? member.roles || [] : null;
+
+  if (!member) return false;
+
+  return member.roles.some((role) =>
+    APPROVAL_ROLES.includes(role)
+  );
 }
 
-async function isAdmin(userId) {
-  const roles = await getDiscordRoles(userId);
-  if (!roles) return false;
-  return roles.some(roleId => APPROVAL_ROLES.has(roleId));
+// Şirket üyeliğini getir
+async function getCompanyMembership(companyId, userId) {
+  const { data, error } = await supabase
+    .from("company_members")
+    .select("*")
+    .eq("company_id", companyId)
+    .eq("discord_user_id", userId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  return data;
 }
 
-async function getCompany(companyId) {
+// Şirket sahibi kontrolü
+async function isCompanyOwner(companyId, userId) {
   const { data, error } = await supabase
     .from("companies")
-    .select("*")
+    .select("id")
     .eq("id", companyId)
+    .eq("owner_discord_id", userId)
     .eq("is_active", true)
     .maybeSingle();
 
   if (error) throw error;
-  return data;
-}
 
-async function isCompanyOwner(companyId, userId) {
-  const { data, error } = await supabase
-    .from("company_members")
-    .select("id")
-    .eq("company_id", companyId)
-    .eq("discord_user_id", userId)
-    .eq("role", "owner")
-    .maybeSingle();
-
-  if (error) throw error;
   return Boolean(data);
 }
 
-async function isCompanyMember(companyId, userId) {
-  const { data, error } = await supabase
-    .from("company_members")
-    .select("id")
-    .eq("company_id", companyId)
-    .eq("discord_user_id", userId)
-    .maybeSingle();
-
-  if (error) throw error;
-  return Boolean(data);
+// Yönetici rol kontrolü
+async function isAuthorizedManager(userId) {
+  return hasApprovalRole(userId);
 }
 
-async function canViewCompany(companyId, userId) {
-  return (await isAdmin(userId)) ||
-    (await isCompanyMember(companyId, userId));
-}
+// Sağlık kontrolü
+app.get("/health", (req, res) => {
+  res.json({
+    online: true,
+    project: "Vindelst Company API",
+  });
+});
 
-function requireIds(companyId, userId) {
-  return validCompanyId(companyId) && validDiscordId(userId);
-}
-
-// --------------------------------------------------
-// ŞİRKET BAŞVURUSU
-// --------------------------------------------------
-
-app.post("/applications", async (req, res) => {
+// Şirket başvurusu oluştur
+app.post("/applications", async (req, res, next) => {
   try {
-    const { name, company_type, owner_discord_id } = req.body;
+    const {
+      name,
+      company_type,
+      owner_discord_id,
+    } = req.body;
 
-    if (
-      typeof name !== "string" ||
-      name.trim().length < 2 ||
-      name.trim().length > 80 ||
-      typeof company_type !== "string" ||
-      company_type.trim().length < 2 ||
-      company_type.trim().length > 60 ||
-      !validDiscordId(owner_discord_id)
-    ) {
-      return res.status(400).json({ error: "Başvuru bilgileri geçersiz." });
+    if (!name || !company_type || !owner_discord_id) {
+      return res.status(400).json({
+        success: false,
+        error: "Şirket adı, türü ve Discord kullanıcı ID'si gerekli.",
+      });
     }
 
-    const { data: existing, error: existingError } = await supabase
-      .from("company_applications")
-      .select("id")
-      .eq("owner_discord_id", owner_discord_id)
-      .eq("status", "pending")
-      .limit(1);
+    const { data: existing, error: existingError } =
+      await supabase
+        .from("company_applications")
+        .select("id")
+        .eq("owner_discord_id", String(owner_discord_id))
+        .eq("status", "pending")
+        .maybeSingle();
 
     if (existingError) throw existingError;
 
-    if (existing?.length) {
+    if (existing) {
       return res.status(409).json({
-        error: "Bekleyen bir şirket başvurun zaten var."
+        success: false,
+        error: "Bekleyen bir şirket başvurun zaten var.",
       });
     }
 
     const { data, error } = await supabase
       .from("company_applications")
       .insert({
-        name: name.trim(),
-        company_type: company_type.trim(),
-        owner_discord_id,
-        status: "pending"
+        name: String(name).trim(),
+        company_type: String(company_type).trim(),
+        owner_discord_id: String(owner_discord_id),
       })
       .select()
       .single();
 
     if (error) throw error;
 
-    return res.status(201).json({
+    res.status(201).json({
       success: true,
-      application: data
+      message: "Şirket başvurusu oluşturuldu.",
+      application: data,
     });
   } catch (error) {
-    return sendDbError(res, error);
+    next(error);
   }
 });
 
-// --------------------------------------------------
-// BAŞVURU ONAYLAMA / REDDETME
-// --------------------------------------------------
+// Şirket başvurusunu onayla veya reddet
+app.post(
+  "/applications/decision",
+  async (req, res, next) => {
+    try {
+      const {
+        application_id,
+        decision,
+        reviewer_discord_id,
+      } = req.body;
 
-app.post("/applications/decision", async (req, res) => {
+      if (
+        !application_id ||
+        !["Onayla", "Reddet"].includes(decision) ||
+        !reviewer_discord_id
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Başvuru ID'si, karar ve inceleyen kullanıcı gerekli.",
+        });
+      }
+
+      const authorized = await hasApprovalRole(
+        String(reviewer_discord_id)
+      );
+
+      if (!authorized) {
+        return res.status(403).json({
+          success: false,
+          error: "Bu işlem için yetkin yok.",
+        });
+      }
+
+      const { data, error } = await supabase.rpc(
+        "decide_company_application",
+        {
+          p_application_id: Number(application_id),
+          p_decision: decision,
+          p_reviewer_discord_id: String(reviewer_discord_id),
+        }
+      );
+
+      if (error) throw error;
+
+      res.json({
+        success: true,
+        result: data,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Aktif şirketleri listele
+app.get("/companies", async (req, res, next) => {
   try {
+    const { data, error } = await supabase
+      .from("companies")
+      .select("*")
+      .eq("is_active", true)
+      .order("name", { ascending: true });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      companies: data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Kullanıcının şirketlerini getir
+app.get("/companies/mine", async (req, res, next) => {
+  try {
+    const userId = String(req.query.user_id || "");
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: "user_id gerekli.",
+      });
+    }
+
+    const { data: memberships, error } = await supabase
+      .from("company_members")
+      .select("company_id, role")
+      .eq("discord_user_id", userId);
+
+    if (error) throw error;
+
+    const { data: owned, error: ownedError } = await supabase
+      .from("companies")
+      .select("*")
+      .eq("owner_discord_id", userId)
+      .eq("is_active", true);
+
+    if (ownedError) throw ownedError;
+
+    const companyIds = [
+      ...new Set([
+        ...(memberships || []).map((m) => m.company_id),
+        ...(owned || []).map((c) => c.id),
+      ]),
+    ];
+
+    let companies = [];
+
+    if (companyIds.length > 0) {
+      const { data, error: companiesError } = await supabase
+        .from("companies")
+        .select("*")
+        .in("id", companyIds)
+        .eq("is_active", true);
+
+      if (companiesError) throw companiesError;
+
+      companies = (data || []).map((company) => {
+        const membership = (memberships || []).find(
+          (m) => Number(m.company_id) === Number(company.id)
+        );
+
+        return {
+          ...company,
+          role:
+            String(company.owner_discord_id) === userId
+              ? "owner"
+              : membership?.role || "partner",
+        };
+      });
+    }
+
+    res.json({
+      success: true,
+      companies,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Şirket kasasını görüntüle
+app.get("/companies/:id/cash", async (req, res, next) => {
+  try {
+    const companyId = Number(req.params.id);
+    const userId = String(req.query.user_id || "");
+
+    if (!Number.isInteger(companyId) || companyId < 1 || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "Geçerli şirket ID'si ve user_id gerekli.",
+      });
+    }
+
+    const { data: company, error } = await supabase
+      .from("companies")
+      .select("*")
+      .eq("id", companyId)
+      .eq("is_active", true)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!company) {
+      return res.status(404).json({
+        success: false,
+        error: "Şirket bulunamadı.",
+      });
+    }
+
+    const membership = await getCompanyMembership(
+      companyId,
+      userId
+    );
+
+    const owner =
+      String(company.owner_discord_id) === userId;
+    const manager = await isAuthorizedManager(userId);
+
+    if (!owner && !membership && !manager) {
+      return res.status(403).json({
+        success: false,
+        error: "Bu şirketin kasasını görüntüleme yetkin yok.",
+      });
+    }
+
+    res.json({
+      success: true,
+      company_id: company.id,
+      company_name: company.name,
+      balance: company.balance,
+      total_revenue: company.total_revenue,
+      total_expenses: company.total_expenses,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Şirket kasası işlemleri: gelir, gider, sermaye
+app.post("/companies/:id/cash", async (req, res, next) => {
+  try {
+    const companyId = Number(req.params.id);
     const {
-      application_id,
-      decision,
-      reviewer_discord_id
+      action,
+      amount,
+      user_id,
     } = req.body;
 
+    const userId = String(user_id || "");
+    const numericAmount = Number(amount);
+
     if (
-      !validCompanyId(application_id) ||
-      !["Onayla", "Reddet"].includes(decision) ||
-      !validDiscordId(reviewer_discord_id)
+      !Number.isInteger(companyId) ||
+      companyId < 1 ||
+      !userId ||
+      !["gelir", "gider", "sermaye"].includes(action) ||
+      !Number.isFinite(numericAmount) ||
+      numericAmount <= 0
     ) {
-      return res.status(400).json({ error: "Başvuru kararı geçersiz." });
+      return res.status(400).json({
+        success: false,
+        error: "İşlem bilgileri geçersiz.",
+      });
     }
 
-    const roles = await getDiscordRoles(reviewer_discord_id);
+    const { data: company, error } = await supabase
+      .from("companies")
+      .select("id, owner_discord_id")
+      .eq("id", companyId)
+      .eq("is_active", true)
+      .maybeSingle();
 
-    if (!roles) {
-      return res.status(403).json({ error: "Discord üyesi sunucuda bulunamadı." });
+    if (error) throw error;
+
+    if (!company) {
+      return res.status(404).json({
+        success: false,
+        error: "Şirket bulunamadı.",
+      });
     }
 
-    if (!roles.some(roleId => APPROVAL_ROLES.has(roleId))) {
-      return res.status(403).json({ error: "Bu işlem için yetkin yok." });
+    if (action === "sermaye") {
+      const owner =
+        String(company.owner_discord_id) === userId;
+
+      if (!owner) {
+        return res.status(403).json({
+          success: false,
+          error: "Sermaye ekleme işlemini yalnızca şirket sahibi yapabilir.",
+        });
+      }
+    } else {
+      const authorized = await isAuthorizedManager(userId);
+
+      if (!authorized) {
+        return res.status(403).json({
+          success: false,
+          error: "Gelir ve gider işlemleri için yönetici yetkisi gerekli.",
+        });
+      }
+    }
+
+    const { data, error: rpcError } = await supabase.rpc(
+      "manage_company_cash",
+      {
+        p_company_id: companyId,
+        p_action: action,
+        p_amount: numericAmount,
+        p_actor_discord_id: userId,
+      }
+    );
+
+    if (rpcError) throw rpcError;
+
+    res.json({
+      success: true,
+      result: data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Şirket seviyesini yükselt
+app.post("/companies/:id/upgrade", async (req, res, next) => {
+  try {
+    const companyId = Number(req.params.id);
+    const userId = String(req.body.user_id || "");
+
+    if (!Number.isInteger(companyId) || companyId < 1 || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "Şirket ID'si ve user_id gerekli.",
+      });
+    }
+
+    const owner = await isCompanyOwner(companyId, userId);
+
+    if (!owner) {
+      return res.status(403).json({
+        success: false,
+        error: "Şirket seviyesini yalnızca sahibi yükseltebilir.",
+      });
     }
 
     const { data, error } = await supabase.rpc(
-      "decide_company_application",
+      "upgrade_company",
       {
-        p_application_id: Number(application_id),
-        p_decision: decision,
-        p_reviewer_discord_id: reviewer_discord_id
+        p_company_id: companyId,
+        p_actor_discord_id: userId,
       }
     );
 
     if (error) throw error;
 
-    return res.json({
+    res.json({
       success: true,
-      result: data
+      result: data,
     });
   } catch (error) {
-    if (error.message === "DISCORD_BOT_TOKEN_MISSING") {
-      return res.status(500).json({ error: "Discord bot tokeni yapılandırılmamış." });
-    }
-    if (error.status) {
-      return res.status(502).json({ error: "Discord üye kontrolü başarısız." });
-    }
-    return sendDbError(res, error);
+    next(error);
   }
 });
 
-// --------------------------------------------------
-// AKTİF ŞİRKETLERİ LİSTELE
-// GET /companies
-// --------------------------------------------------
-
-app.get("/companies", async (req, res) => {
+// Şirkete ortak ekle
+app.post("/companies/:id/members", async (req, res, next) => {
   try {
-    const requestedLimit = Number(req.query.limit || 50);
-    const limit = Number.isInteger(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 100)
-      : 50;
-
-    const { data, error } = await supabase
-      .from("companies")
-      .select("id, name, company_type, owner_discord_id, balance, total_revenue, total_expenses, level, created_at")
-      .eq("is_active", true)
-      .order("id", { ascending: true })
-      .limit(limit);
-
-    if (error) throw error;
-
-    return res.json({
-      success: true,
-      companies: data || []
-    });
-  } catch (error) {
-    return sendDbError(res, error);
-  }
-});
-
-// --------------------------------------------------
-// ŞİRKETİM
-// GET /companies/mine?user_id=DISCORD_ID
-// --------------------------------------------------
-
-app.get("/companies/mine", async (req, res) => {
-  try {
-    const userId = req.query.user_id;
-
-    if (!validDiscordId(userId)) {
-      return res.status(400).json({ error: "Geçerli bir user_id gerekli." });
-    }
-
-    const { data: memberships, error: memberError } = await supabase
-      .from("company_members")
-      .select("company_id, role")
-      .eq("discord_user_id", userId);
-
-    if (memberError) throw memberError;
-
-    const companyIds = [...new Set((memberships || []).map(row => row.company_id))];
-
-    if (!companyIds.length) {
-      return res.json({ success: true, companies: [] });
-    }
-
-    const { data: companies, error: companyError } = await supabase
-      .from("companies")
-      .select("id, name, company_type, owner_discord_id, balance, total_revenue, total_expenses, level, created_at")
-      .in("id", companyIds)
-      .eq("is_active", true);
-
-    if (companyError) throw companyError;
-
-    const results = (companies || []).map(company => ({
-      ...company,
-      role: memberships.find(row => String(row.company_id) === String(company.id))?.role
-    }));
-
-    return res.json({ success: true, companies: results });
-  } catch (error) {
-    return sendDbError(res, error);
-  }
-});
-
-// --------------------------------------------------
-// ŞİRKET KASASINI GÖRÜNTÜLE
-// GET /companies/:id/cash?user_id=DISCORD_ID
-// --------------------------------------------------
-
-app.get("/companies/:id/cash", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.query.user_id;
-
-    if (!requireIds(id, userId)) {
-      return res.status(400).json({ error: "Şirket veya kullanıcı ID'si geçersiz." });
-    }
-
-    if (!(await canViewCompany(id, userId))) {
-      return res.status(403).json({ error: "Bu şirketin kasasını görüntüleme yetkin yok." });
-    }
-
-    const company = await getCompany(Number(id));
-
-    if (!company) {
-      return res.status(404).json({ error: "Şirket bulunamadı veya aktif değil." });
-    }
-
-    return res.json({
-      success: true,
-      company_id: company.id,
-      name: company.name,
-      balance: company.balance,
-      level: company.level
-    });
-  } catch (error) {
-    return sendDbError(res, error);
-  }
-});
-
-// --------------------------------------------------
-// KASAYA PARA EKLE / KASADAN PARA SİL
-// POST /companies/:id/cash
-// Body: { user_id, action: "ekle"|"sil", amount }
-// Yalnızca yetkili yönetici rolleri kullanabilir.
-// --------------------------------------------------
-
-app.post("/companies/:id/cash", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { user_id, action, amount } = req.body;
-
-    if (!requireIds(id, user_id)) {
-      return res.status(400).json({ error: "Şirket veya kullanıcı ID'si geçersiz." });
-    }
-
-    if (!["ekle", "sil"].includes(action) || !validAmount(amount)) {
-      return res.status(400).json({ error: "İşlem veya miktar geçersiz." });
-    }
-
-    if (!(await isAdmin(user_id))) {
-      return res.status(403).json({ error: "Kasa düzenleme yetkin yok." });
-    }
-
-    const { data, error } = await supabase.rpc("manage_company_cash", {
-      p_company_id: Number(id),
-      p_action: action,
-      p_amount: Number(amount),
-      p_actor_discord_id: user_id
-    });
-
-    if (error) throw error;
-
-    return res.json(data);
-  } catch (error) {
-    if (error.message === "DISCORD_BOT_TOKEN_MISSING") {
-      return res.status(500).json({ error: "Discord bot tokeni yapılandırılmamış." });
-    }
-    if (error.status) {
-      return res.status(502).json({ error: "Discord üye kontrolü başarısız." });
-    }
-    return sendDbError(res, error);
-  }
-});
-
-// --------------------------------------------------
-// ŞİRKETİ YÜKSELT
-// POST /companies/:id/upgrade
-// Body: { user_id }
-// Yalnızca şirket sahibi yükseltebilir.
-// --------------------------------------------------
-
-app.post("/companies/:id/upgrade", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { user_id } = req.body;
-
-    if (!requireIds(id, user_id)) {
-      return res.status(400).json({ error: "Şirket veya kullanıcı ID'si geçersiz." });
-    }
-
-    if (!(await isCompanyOwner(id, user_id))) {
-      return res.status(403).json({ error: "Şirketi yükseltme yetkisi yalnızca sahibinde." });
-    }
-
-    const { data, error } = await supabase.rpc("upgrade_company", {
-      p_company_id: Number(id),
-      p_actor_discord_id: user_id
-    });
-
-    if (error) throw error;
-
-    return res.json(data);
-  } catch (error) {
-    return sendDbError(res, error);
-  }
-});
-
-// --------------------------------------------------
-// ÇALIŞAN EKLE
-// POST /companies/:id/members
-// Body: { user_id: OWNER_ID, member_discord_id: NEW_MEMBER_ID }
-// --------------------------------------------------
-
-app.post("/companies/:id/members", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { user_id, member_discord_id } = req.body;
+    const companyId = Number(req.params.id);
+    const ownerId = String(req.body.user_id || "");
+    const memberId = String(req.body.member_discord_id || "");
 
     if (
-      !requireIds(id, user_id) ||
-      !validDiscordId(member_discord_id)
+      !Number.isInteger(companyId) ||
+      companyId < 1 ||
+      !ownerId ||
+      !memberId
     ) {
-      return res.status(400).json({ error: "Şirket veya kullanıcı ID'si geçersiz." });
+      return res.status(400).json({
+        success: false,
+        error: "Şirket ID'si, sahip ID'si ve ortak ID'si gerekli.",
+      });
     }
 
-    if (!(await isCompanyOwner(id, user_id))) {
-      return res.status(403).json({ error: "Çalışan ekleme yetkisi yalnızca şirkette." });
+    const owner = await isCompanyOwner(companyId, ownerId);
+
+    if (!owner) {
+      return res.status(403).json({
+        success: false,
+        error: "Ortak ekleme yetkisi yalnızca şirkete aittir.",
+      });
     }
 
-    const company = await getCompany(Number(id));
-
-    if (!company) {
-      return res.status(404).json({ error: "Şirket bulunamadı veya aktif değil." });
-    }
-
-    const member = await getDiscordMember(member_discord_id);
+    const member = await getDiscordMember(memberId);
 
     if (!member) {
-      return res.status(404).json({ error: "Eklenecek kullanıcı Discord sunucusunda bulunamadı." });
+      return res.status(404).json({
+        success: false,
+        error: "Eklenecek kullanıcı Discord sunucusunda bulunamadı.",
+      });
     }
 
-    const { data: existing, error: existingError } = await supabase
-      .from("company_members")
-      .select("id, company_id")
-      .eq("discord_user_id", member_discord_id)
-      .limit(1);
+    const { data: existing, error: existingError } =
+      await supabase
+        .from("company_members")
+        .select("company_id")
+        .eq("discord_user_id", memberId);
 
     if (existingError) throw existingError;
 
-    if (existing?.length) {
+    if (existing && existing.length > 0) {
       return res.status(409).json({
-        error: "Bu kullanıcı zaten bir şirkete kayıtlı."
+        success: false,
+        error: "Bu kullanıcı zaten bir şirkete bağlı.",
       });
     }
 
     const { data, error } = await supabase
       .from("company_members")
       .insert({
-        company_id: Number(id),
-        discord_user_id: member_discord_id,
-        role: "partner"
+        company_id: companyId,
+        discord_user_id: memberId,
+        role: "partner",
       })
       .select()
       .single();
 
     if (error) throw error;
 
-    return res.status(201).json({
+    res.status(201).json({
       success: true,
-      member: data
+      member: data,
     });
   } catch (error) {
-    if (error.message === "DISCORD_BOT_TOKEN_MISSING") {
-      return res.status(500).json({ error: "Discord bot tokeni yapılandırılmamış." });
-    }
-    if (error.status) {
-      return res.status(502).json({ error: "Discord üye kontrolü başarısız." });
-    }
-    return sendDbError(res, error);
+    next(error);
   }
 });
 
-// --------------------------------------------------
-// ÇALIŞAN SİL
-// DELETE /companies/:id/members/:memberId
-// Query: ?user_id=OWNER_ID
-// --------------------------------------------------
+// Şirket ortağını çıkar
+app.delete(
+  "/companies/:id/members/:memberId",
+  async (req, res, next) => {
+    try {
+      const companyId = Number(req.params.id);
+      const memberId = String(req.params.memberId);
+      const ownerId = String(req.query.user_id || "");
 
-app.delete("/companies/:id/members/:memberId", async (req, res) => {
-  try {
-    const { id, memberId } = req.params;
-    const userId = req.query.user_id;
+      if (
+        !Number.isInteger(companyId) ||
+        companyId < 1 ||
+        !memberId ||
+        !ownerId
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "İşlem bilgileri eksik.",
+        });
+      }
 
-    if (
-      !requireIds(id, userId) ||
-      !validDiscordId(memberId)
-    ) {
-      return res.status(400).json({ error: "Şirket veya kullanıcı ID'si geçersiz." });
+      const owner = await isCompanyOwner(companyId, ownerId);
+
+      if (!owner) {
+        return res.status(403).json({
+          success: false,
+          error: "Ortak çıkarma yetkisi yalnızca şirkete aittir.",
+        });
+      }
+
+      const { data: company, error: companyError } =
+        await supabase
+          .from("companies")
+          .select("owner_discord_id")
+          .eq("id", companyId)
+          .maybeSingle();
+
+      if (companyError) throw companyError;
+
+      if (
+        company &&
+        String(company.owner_discord_id) === memberId
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Şirket sahibi ortak olarak çıkarılamaz.",
+        });
+      }
+
+      const { data, error } = await supabase
+        .from("company_members")
+        .delete()
+        .eq("company_id", companyId)
+        .eq("discord_user_id", memberId)
+        .select();
+
+      if (error) throw error;
+
+      if (!data || data.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: "Şirket ortağı bulunamadı.",
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "Ortak şirketten çıkarıldı.",
+      });
+    } catch (error) {
+      next(error);
     }
-
-    if (!(await isCompanyOwner(id, userId))) {
-      return res.status(403).json({ error: "Çalışan silme yetkisi yalnızca şirkette." });
-    }
-
-    if (userId === memberId) {
-      return res.status(400).json({ error: "Şirket sahibi bu uç noktadan silinemez." });
-    }
-
-    const { data: target, error: targetError } = await supabase
-      .from("company_members")
-      .select("id, role")
-      .eq("company_id", Number(id))
-      .eq("discord_user_id", memberId)
-      .maybeSingle();
-
-    if (targetError) throw targetError;
-
-    if (!target) {
-      return res.status(404).json({ error: "Bu çalışan şirkette bulunamadı." });
-    }
-
-    if (target.role === "owner") {
-      return res.status(400).json({ error: "Şirket sahibi çalışan olarak silinemez." });
-    }
-
-    const { error } = await supabase
-      .from("company_members")
-      .delete()
-      .eq("company_id", Number(id))
-      .eq("discord_user_id", memberId);
-
-    if (error) throw error;
-
-    return res.json({
-      success: true,
-      message: "Çalışan şirketten çıkarıldı."
-    });
-  } catch (error) {
-    return sendDbError(res, error);
   }
-});
+);
 
-// --------------------------------------------------
-// ŞİRKETİ SİL (SOFT DELETE)
-// DELETE /companies/:id
-// Query: ?user_id=DISCORD_ID
-// Şirket sahibi veya yönetici rolü gerekir.
-// --------------------------------------------------
-
-app.delete("/companies/:id", async (req, res) => {
+// Şirketi pasifleştir
+app.delete("/companies/:id", async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const userId = req.query.user_id;
+    const companyId = Number(req.params.id);
+    const userId = String(req.query.user_id || "");
 
-    if (!requireIds(id, userId)) {
-      return res.status(400).json({ error: "Şirket veya kullanıcı ID'si geçersiz." });
+    if (!Number.isInteger(companyId) || companyId < 1 || !userId) {
+      return res.status(400).json({
+        success: false,
+        error: "Şirket ID'si ve user_id gerekli.",
+      });
     }
 
-    const authorized =
-      (await isCompanyOwner(id, userId)) ||
-      (await isAdmin(userId));
+    const owner = await isCompanyOwner(companyId, userId);
 
-    if (!authorized) {
-      return res.status(403).json({ error: "Şirket silme yetkin yok." });
+    if (!owner) {
+      return res.status(403).json({
+        success: false,
+        error: "Şirketi yalnızca sahibi kapatabilir.",
+      });
     }
 
     const { data, error } = await supabase
       .from("companies")
       .update({ is_active: false })
-      .eq("id", Number(id))
+      .eq("id", companyId)
+      .eq("owner_discord_id", userId)
       .eq("is_active", true)
-      .select("id, name")
-      .maybeSingle();
+      .select()
+      .single();
 
     if (error) throw error;
 
-    if (!data) {
-      return res.status(404).json({ error: "Şirket bulunamadı veya zaten silinmiş." });
-    }
-
-    return res.json({
+    res.json({
       success: true,
-      message: "Şirket pasifleştirildi.",
-      company: data
+      message: "Şirket kapatıldı.",
+      company: data,
     });
   } catch (error) {
-    return sendDbError(res, error);
+    next(error);
   }
 });
 
-// --------------------------------------------------
-// GENEL HATA YÖNETİMİ
-// --------------------------------------------------
-
-app.use((error, req, res, next) => {
-  console.error("Beklenmeyen API hatası:", error?.message || error);
-
-  if (res.headersSent) return next(error);
-
-  return res.status(500).json({
-    error: "Beklenmeyen sunucu hatası."
+// Bulunamayan endpoint
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: "Endpoint bulunamadı.",
   });
 });
 
+// Genel hata yakalayıcı
+app.use((error, req, res, next) => {
+  console.error("API hatası:", error.message);
+
+  res.status(500).json({
+    success: false,
+    error: "Sunucu hatası oluştu.",
+  });
+});
+
+// Sunucuyu başlat
 app.listen(PORT, () => {
-  console.log(`Vindelst Company API ${PORT} portunda çalışıyor.`);
+  console.log(
+    `Vindelst Company API ${PORT} portunda çalışıyor.`
+  );
 });
